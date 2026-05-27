@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 import time
 from collections.abc import Iterable
 from typing import Any
@@ -23,6 +24,10 @@ class NotionClientError(RuntimeError):
     """Raised when a Notion API operation fails with an agent-readable message."""
 
 
+class AmbiguousMatchError(NotionClientError):
+    """Raised when a page title lookup matches more than one child page."""
+
+
 class NotionCoreClient:
     """Core Notion API wrapper with pagination, chunking, and retry handling."""
 
@@ -41,10 +46,11 @@ class NotionCoreClient:
         auth_token = token or get_config().notion_token
         self.notion = Client(auth=auth_token)
 
-    def find_page_by_title(self, parent_page_id: str, title_prefix: str) -> str | None:
-        """Find a child page whose title starts with `title_prefix`."""
+    def find_page_by_title(self, parent_page_id: str, title: str, exact: bool = True) -> str | None:
+        """Find a child page by exact title or by a safe title prefix."""
 
         start_cursor: str | None = None
+        matches: list[tuple[str, str]] = []
         try:
             while True:
                 response = self._call_with_retry(
@@ -56,13 +62,20 @@ class NotionCoreClient:
                 for block in response.get("results", []):
                     if block.get("type") != "child_page":
                         continue
-                    title = block.get("child_page", {}).get("title", "")
-                    if title.startswith(title_prefix):
+                    page_title = block.get("child_page", {}).get("title", "")
+                    if _title_matches(page_title, title, exact):
                         page_id = block.get("id")
-                        return str(page_id) if page_id else None
+                        if page_id:
+                            matches.append((str(page_id), str(page_title)))
 
                 if not response.get("has_more"):
-                    return None
+                    if len(matches) > 1:
+                        matched_titles = ", ".join(match_title for _, match_title in matches)
+                        mode = "exact title" if exact else "title prefix"
+                        raise AmbiguousMatchError(
+                            f"Ambiguous Notion child page lookup by {mode} {title!r}: {matched_titles}"
+                        )
+                    return matches[0][0] if matches else None
                 start_cursor = response.get("next_cursor")
         except APIResponseError as exc:
             raise _wrap_api_error("find child page", exc) from exc
@@ -150,6 +163,7 @@ class NotionCoreClient:
                     raise
                 retry_after = _retry_after_seconds(exc)
                 delay = retry_after if retry_after is not None else BASE_RETRY_DELAY_SECONDS * (2**attempt)
+                delay = delay * (0.8 + 0.4 * random.random())
                 time.sleep(delay)
 
         raise NotionClientError("Notion API request failed after retries")
@@ -171,6 +185,18 @@ def _title_properties(title: str) -> dict[str, Any]:
             ]
         }
     }
+
+
+def _title_matches(page_title: str, query: str, exact: bool) -> bool:
+    if exact:
+        return page_title == query
+    if not page_title.startswith(query):
+        return False
+    if len(page_title) == len(query):
+        return True
+    if not query:
+        return False
+    return not query[-1].isalnum() or not page_title[len(query)].isalnum()
 
 
 def _wrap_api_error(action: str, exc: APIResponseError) -> NotionClientError:

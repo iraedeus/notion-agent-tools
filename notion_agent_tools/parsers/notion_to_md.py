@@ -17,7 +17,7 @@ def notion_to_markdown(blocks: list[NotionBlock], client: NotionCoreClient) -> s
     whenever a block has `has_children=True`.
     """
 
-    return _join_blocks(_render_blocks(blocks, client, indent=0)).strip()
+    return _join_blocks(_render_blocks(blocks, client, indent=0)).strip("\n")
 
 
 def rich_text_to_markdown(rich_text: list[RichText]) -> str:
@@ -64,7 +64,7 @@ def _render_block(block: NotionBlock, client: NotionCoreClient, indent: int) -> 
     if block_type == "code":
         code = block.get("code", {})
         language = str(code.get("language") or "").strip()
-        text = rich_text_to_markdown(code.get("rich_text", []))
+        text = _rich_text_to_plain_text(code.get("rich_text", []))
         fence = f"```{language}" if language and language != "plain text" else "```"
         return f"{spaces}{fence}\n{_indent_text(text, indent)}\n{spaces}```"
 
@@ -194,10 +194,24 @@ def _rich_text_item_to_markdown(item: RichText) -> str:
     link_data = text_data.get("link")
     link_url = link_data.get("url") if isinstance(link_data, dict) else None
     href = item.get("href") or link_url
-    content = _apply_annotations(content, item.get("annotations", {}))
+    annotations = item.get("annotations", {})
+    if not annotations.get("code"):
+        content = _escape_markdown_text(content)
+    content = _apply_annotations(content, annotations)
     if isinstance(href, str) and href:
         return f"[{content}]({href})"
     return content
+
+
+def _rich_text_to_plain_text(rich_text: list[RichText]) -> str:
+    return "".join(_rich_text_item_to_plain_text(item) for item in rich_text)
+
+
+def _rich_text_item_to_plain_text(item: RichText) -> str:
+    if item.get("type") == "equation":
+        return str(item.get("equation", {}).get("expression", ""))
+    text_data = item.get("text", {}) if isinstance(item.get("text"), dict) else {}
+    return str(text_data.get("content") or item.get("plain_text") or "")
 
 
 def _apply_annotations(content: str, annotations: dict[str, Any]) -> str:
@@ -218,6 +232,14 @@ def _callout_color(color: str) -> str:
     if color in {"default", ""}:
         return ""
     return color.removesuffix("_background")
+
+
+def _escape_markdown_text(content: str) -> str:
+    content = content.replace("\\", "\\\\")
+    content = content.replace("==", "\\=\\=")
+    for char in ("*", "_", "$", "[", "]"):
+        content = content.replace(char, f"\\{char}")
+    return content
 
 
 def _indent_text(text: str, indent: int) -> str:

@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+import json
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
 from notion_agent_tools.core.client import (
     MAX_BLOCKS_PER_REQUEST,
     NotionClientError,
@@ -31,13 +37,27 @@ def upsert_page(title: str, markdown_content: str, parent_id: str | None = None)
         target_parent_id = parent_id or get_config().notion_parent_page
         blocks = markdown_to_notion(markdown_content)
         client = NotionCoreClient()
-        
-        existing_page_id = client.find_page_by_title(target_parent_id, clean_title)
+
+        existing_page_id = client.find_page_by_title(target_parent_id, clean_title, exact=True)
 
         if existing_page_id is not None:
             page = client.update_page_title(existing_page_id, clean_title)
             client.clear_page_blocks(existing_page_id)
-            client.append_blocks_chunked(existing_page_id, blocks)
+            try:
+                client.append_blocks_chunked(existing_page_id, blocks)
+            except Exception as exc:
+                backup_path = _write_failed_upsert_backup(
+                    title=clean_title,
+                    parent_id=target_parent_id,
+                    page_id=existing_page_id,
+                    markdown_content=markdown_content,
+                    blocks=blocks,
+                    error=exc,
+                )
+                raise AgentToolError(
+                    "Failed to append Notion blocks after clearing existing page. "
+                    f"Content backup was written to {backup_path}: {exc}"
+                ) from exc
             return _page_url(page)
 
         page = client.create_child_page(
@@ -50,6 +70,8 @@ def upsert_page(title: str, markdown_content: str, parent_id: str | None = None)
             page_id = str(page["id"])
             client.append_blocks_chunked(page_id, remaining_blocks)
         return _page_url(page)
+    except AgentToolError:
+        raise
     except (ConfigError, NotionClientError) as exc:
         raise AgentToolError(str(exc)) from exc
     except Exception as exc:
@@ -66,7 +88,7 @@ def read_page(title: str, parent_id: str | None = None) -> str:
     try:
         target_parent_id = parent_id or get_config().notion_parent_page
         client = NotionCoreClient()
-        page_id = client.find_page_by_title(target_parent_id, clean_title)
+        page_id = client.find_page_by_title(target_parent_id, clean_title, exact=True)
         if page_id is None:
             raise AgentToolError(f"Page not found: {clean_title}")
 
@@ -93,12 +115,12 @@ def find_page_url(title_prefix: str, parent_id: str | None = None) -> str | None
     try:
         target_parent_id = parent_id or get_config().notion_parent_page
         client = NotionCoreClient()
-        page_id = client.find_page_by_title(target_parent_id, prefix)
+        page_id = client.find_page_by_title(target_parent_id, prefix, exact=False)
         if page_id is None:
             return None
         return f"https://www.notion.so/{page_id.replace('-', '')}"
-    except Exception:
-        return None
+    except (ConfigError, NotionClientError) as exc:
+        raise AgentToolError(str(exc)) from exc
 
 
 def _page_url(page: dict[str, object]) -> str:
@@ -109,3 +131,29 @@ def _page_url(page: dict[str, object]) -> str:
     if isinstance(page_id, str) and page_id:
         return f"https://www.notion.so/{page_id.replace('-', '')}"
     raise AgentToolError("Notion response did not include page URL or page ID")
+
+
+def _write_failed_upsert_backup(
+    title: str,
+    parent_id: str,
+    page_id: str,
+    markdown_content: str,
+    blocks: list[dict[str, Any]],
+    error: BaseException,
+) -> Path:
+    backup_dir = Path("notion_upsert_backups")
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    safe_title = re.sub(r"[^A-Za-z0-9_.-]+", "_", title).strip("_") or "untitled"
+    backup_path = backup_dir / f"{timestamp}_{safe_title}.json"
+    payload = {
+        "title": title,
+        "parent_id": parent_id,
+        "page_id": page_id,
+        "markdown_content": markdown_content,
+        "blocks": blocks,
+        "error": repr(error),
+        "created_at": timestamp,
+    }
+    backup_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return backup_path

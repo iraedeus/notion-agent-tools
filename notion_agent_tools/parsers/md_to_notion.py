@@ -12,6 +12,15 @@ from notion_agent_tools.parsers.md_ast import parse_markdown
 NotionBlock = dict[str, Any]
 RichText = dict[str, Any]
 
+MAX_RICH_TEXT_CONTENT_LENGTH = 1800
+MAX_EQUATION_EXPRESSION_LENGTH = 1000
+MAX_BLOCK_NESTING_DEPTH = 3
+
+
+class UnsupportedNestingError(ValueError):
+    """Raised when markdown nesting exceeds the supported Notion-safe depth."""
+
+
 _OPEN_TO_CLOSE = {
     "paragraph_open": "paragraph_close",
     "heading_open": "heading_close",
@@ -39,11 +48,17 @@ def markdown_to_notion(md_text: str) -> list[NotionBlock]:
     """Convert AN-MD text into Notion API block payloads."""
 
     tokens = parse_markdown(md_text)
-    blocks, _ = _parse_blocks(tokens, 0)
+    blocks, _ = _parse_blocks(tokens, 0, depth=0)
     return blocks
 
 
-def _parse_blocks(tokens: list[Token], index: int, stop_type: str | None = None) -> tuple[list[NotionBlock], int]:
+def _parse_blocks(
+    tokens: list[Token],
+    index: int,
+    stop_type: str | None = None,
+    depth: int = 0,
+) -> tuple[list[NotionBlock], int]:
+    _validate_depth(depth)
     blocks: list[NotionBlock] = []
 
     while index < len(tokens):
@@ -63,17 +78,17 @@ def _parse_blocks(tokens: list[Token], index: int, stop_type: str | None = None)
             continue
 
         if token.type in {"bullet_list_open", "ordered_list_open"}:
-            list_blocks, index = _parse_list(tokens, index)
+            list_blocks, index = _parse_list(tokens, index, depth)
             blocks.extend(list_blocks)
             continue
 
         if token.type == "blockquote_open":
-            block, index = _parse_blockquote(tokens, index)
+            block, index = _parse_blockquote(tokens, index, depth)
             blocks.append(block)
             continue
 
         if token.type == "an_container_open":
-            block, index = _parse_container(tokens, index)
+            block, index = _parse_container(tokens, index, depth)
             blocks.append(block)
             continue
 
@@ -115,7 +130,7 @@ def _parse_heading(tokens: list[Token], index: int) -> tuple[NotionBlock, int]:
     return _text_block(notion_type, rich_text), _skip_to_close(tokens, index, "heading_close")
 
 
-def _parse_list(tokens: list[Token], index: int) -> tuple[list[NotionBlock], int]:
+def _parse_list(tokens: list[Token], index: int, depth: int) -> tuple[list[NotionBlock], int]:
     list_type = "bulleted_list_item" if tokens[index].type == "bullet_list_open" else "numbered_list_item"
     close_type = _OPEN_TO_CLOSE[tokens[index].type]
     index += 1
@@ -125,13 +140,14 @@ def _parse_list(tokens: list[Token], index: int) -> tuple[list[NotionBlock], int
         if tokens[index].type != "list_item_open":
             index += 1
             continue
-        item_block, index = _parse_list_item(tokens, index, list_type)
+        item_block, index = _parse_list_item(tokens, index, list_type, depth + 1)
         items.append(item_block)
 
     return items, index + 1
 
 
-def _parse_list_item(tokens: list[Token], index: int, list_type: str) -> tuple[NotionBlock, int]:
+def _parse_list_item(tokens: list[Token], index: int, list_type: str, depth: int) -> tuple[NotionBlock, int]:
+    _validate_depth(depth)
     index += 1
     rich_text: list[RichText] = []
     children: list[NotionBlock] = []
@@ -141,15 +157,17 @@ def _parse_list_item(tokens: list[Token], index: int, list_type: str) -> tuple[N
         rich_text = _inline_to_rich_text(inline_token.children or []) if inline_token and inline_token.type == "inline" else []
         index = _skip_to_close(tokens, index, "paragraph_close")
 
-    children, index = _parse_blocks(tokens, index, "list_item_close")
+    children, index = _parse_blocks(tokens, index, "list_item_close", depth)
     block = _text_block(list_type, rich_text)
     if children:
         block[list_type]["children"] = children
     return block, index
 
 
-def _parse_blockquote(tokens: list[Token], index: int) -> tuple[NotionBlock, int]:
-    children, next_index = _parse_blocks(tokens, index + 1, "blockquote_close")
+def _parse_blockquote(tokens: list[Token], index: int, depth: int) -> tuple[NotionBlock, int]:
+    next_depth = depth + 1
+    _validate_depth(next_depth)
+    children, next_index = _parse_blocks(tokens, index + 1, "blockquote_close", next_depth)
     if children and children[0]["type"] == "paragraph":
         rich_text = children[0]["paragraph"]["rich_text"]
         nested = children[1:]
@@ -162,11 +180,13 @@ def _parse_blockquote(tokens: list[Token], index: int) -> tuple[NotionBlock, int
     return block, next_index
 
 
-def _parse_container(tokens: list[Token], index: int) -> tuple[NotionBlock, int]:
+def _parse_container(tokens: list[Token], index: int, depth: int) -> tuple[NotionBlock, int]:
     token = tokens[index]
     meta = token.meta or {}
     kind = meta.get("kind")
-    children, next_index = _parse_blocks(tokens, index + 1, "an_container_close")
+    next_depth = depth + 1
+    _validate_depth(next_depth)
+    children, next_index = _parse_blocks(tokens, index + 1, "an_container_close", next_depth)
 
     if kind == "toggle":
         rich_text = _plain_rich_text(meta.get("title") or "Toggle")
@@ -200,15 +220,15 @@ def _append_inline_tokens(tokens: list[Token], output: list[RichText], annotatio
         current = stack[-1]
 
         if token.type == "text":
-            output.append(_text_rich_text(token.content, current))
+            output.extend(_text_rich_text_chunks(token.content, current))
         elif token.type == "softbreak":
-            output.append(_text_rich_text("\n", current))
+            output.extend(_text_rich_text_chunks("\n", current))
         elif token.type == "hardbreak":
-            output.append(_text_rich_text("\n", current))
+            output.extend(_text_rich_text_chunks("\n", current))
         elif token.type == "code_inline":
             next_annotations = current.copy()
             next_annotations["code"] = True
-            output.append(_text_rich_text(token.content, next_annotations))
+            output.extend(_text_rich_text_chunks(token.content, next_annotations))
         elif token.type == "math_inline":
             output.append(_equation_rich_text(token.content))
         elif token.type in {"strong_open", "em_open", "s_open", "mark_open"}:
@@ -237,6 +257,7 @@ def _text_block(block_type: str, rich_text: list[RichText]) -> NotionBlock:
 
 
 def _equation_block(expression: str) -> NotionBlock:
+    _validate_equation_expression(expression, "block equation")
     return {
         "object": "block",
         "type": "equation",
@@ -250,17 +271,22 @@ def _code_block(content: str, info: str) -> NotionBlock:
         "object": "block",
         "type": "code",
         "code": {
-            "rich_text": _plain_rich_text(content.rstrip("\n")),
+            "rich_text": _plain_rich_text(content),
             "language": language or "plain text",
         },
     }
 
 
 def _plain_rich_text(content: str) -> list[RichText]:
-    return [_text_rich_text(content, _default_annotations())] if content else []
+    return _text_rich_text_chunks(content, _default_annotations())
 
 
 def _text_rich_text(content: str, annotations: dict[str, Any]) -> RichText:
+    if len(content) > MAX_RICH_TEXT_CONTENT_LENGTH:
+        raise ValueError(
+            "_text_rich_text received oversized content; use _text_rich_text_chunks "
+            f"for strings longer than {MAX_RICH_TEXT_CONTENT_LENGTH} characters"
+        )
     return {
         "type": "text",
         "text": {"content": content, "link": None},
@@ -271,6 +297,7 @@ def _text_rich_text(content: str, annotations: dict[str, Any]) -> RichText:
 
 
 def _equation_rich_text(expression: str) -> RichText:
+    _validate_equation_expression(expression, "inline equation")
     return {
         "type": "equation",
         "equation": {"expression": expression},
@@ -278,6 +305,30 @@ def _equation_rich_text(expression: str) -> RichText:
         "plain_text": expression,
         "href": None,
     }
+
+
+def _text_rich_text_chunks(content: str, annotations: dict[str, Any]) -> list[RichText]:
+    if not content:
+        return []
+    return [
+        _text_rich_text(content[index : index + MAX_RICH_TEXT_CONTENT_LENGTH], annotations)
+        for index in range(0, len(content), MAX_RICH_TEXT_CONTENT_LENGTH)
+    ]
+
+
+def _validate_equation_expression(expression: str, context: str) -> None:
+    if len(expression) > MAX_EQUATION_EXPRESSION_LENGTH:
+        raise ValueError(
+            f"{context} exceeds {MAX_EQUATION_EXPRESSION_LENGTH} characters "
+            f"({len(expression)} characters)"
+        )
+
+
+def _validate_depth(depth: int) -> None:
+    if depth > MAX_BLOCK_NESTING_DEPTH:
+        raise UnsupportedNestingError(
+            f"Markdown block nesting exceeds supported depth of {MAX_BLOCK_NESTING_DEPTH}: depth={depth}"
+        )
 
 
 def _default_annotations() -> dict[str, Any]:

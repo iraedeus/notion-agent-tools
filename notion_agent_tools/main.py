@@ -3,38 +3,46 @@
 from __future__ import annotations
 
 from notion_agent_tools.agent_tools import AgentToolError, read_page, upsert_page
+from notion_agent_tools.parsers.md_to_notion import markdown_to_notion
 
 
-SAMPLE_MD = """# ТРПО: сложный конспект
+LONG_PARAGRAPH = (
+    "Длинный абзац для проверки авто-дробления rich_text. "
+    "Обычные символы разметки должны пережить round-trip как текст: "
+    "\\*, \\_, \\$, \\=\\=, \\[, \\], \\\\. "
+    * 35
+)
+
+
+SAMPLE_MD = f"""# Milestone 4: stability demo
+
+{LONG_PARAGRAPH}
 
 Обычный текст с inline формулой $E=mc^2$ и ==желтым маркером==.
 
-:::callout-blue [Важно для экзамена]
-Внутри callout есть список:
+```python
+print("trailing newline is preserved")
 
-1. Первый пункт с формулой $a^2 + b^2 = c^2$.
-2. Второй пункт со вложенным toggle:
+```
 
-   :::toggle [Доказательство]
-   Блочная формула:
+:::callout-blue [Важно]
+1. Первый пункт.
+2. Второй пункт с вложенным toggle:
 
-   $$
-   \\int_a^b f(x)dx = F(b) - F(a)
-   $$
-
-   - Вложенный маркированный список
-   - Еще пункт с ==акцентом==
+   :::toggle [Детали]
+   Вложенность остается в поддерживаемом лимите.
    :::
-:::
-
-:::toggle [Контрольный вопрос]
-Почему regex-парсер ломается на таких структурах?
 :::
 """
 
 
 def main() -> None:
-    page_title = "ТРПО: сложный конспект"
+    page_title = "Milestone 4: stability demo"
+    blocks = markdown_to_notion(SAMPLE_MD)
+    first_paragraph = next(block for block in blocks if block["type"] == "paragraph")
+    chunks = first_paragraph["paragraph"]["rich_text"]
+    max_chunk_length = max(len(item["plain_text"]) for item in chunks)
+
     try:
         url = upsert_page(page_title, SAMPLE_MD)
         markdown = read_page(page_title)
@@ -42,6 +50,9 @@ def main() -> None:
         print(f"Notion round-trip failed: {exc}")
         return
     print(f"Uploaded Notion page: {url}")
+    print(f"Long paragraph length: {len(LONG_PARAGRAPH)}")
+    print(f"Generated rich_text chunks: {len(chunks)}")
+    print(f"Max rich_text chunk length: {max_chunk_length}")
     print("\n--- Round-trip AN-MD ---\n")
     print(markdown)
 
