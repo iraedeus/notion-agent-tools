@@ -3,13 +3,10 @@
 from __future__ import annotations
 
 import json
-import re
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from notion_agent_tools.core.client import (
-    MAX_BLOCKS_PER_REQUEST,
     NotionClientError,
     NotionCoreClient,
 )
@@ -65,10 +62,6 @@ def upsert_page(title: str, markdown_content: str, parent_id: str | None = None)
             title=clean_title,
             blocks=blocks,
         )
-        remaining_blocks = blocks[MAX_BLOCKS_PER_REQUEST:]
-        if remaining_blocks:
-            page_id = str(page["id"])
-            client.append_blocks_chunked(page_id, remaining_blocks)
         return _page_url(page)
     except AgentToolError:
         raise
@@ -141,11 +134,7 @@ def _write_failed_upsert_backup(
     blocks: list[dict[str, Any]],
     error: BaseException,
 ) -> Path:
-    backup_dir = Path("notion_upsert_backups")
-    backup_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    safe_title = re.sub(r"[^A-Za-z0-9_.-]+", "_", title).strip("_") or "untitled"
-    backup_path = backup_dir / f"{timestamp}_{safe_title}.json"
+    backup_path = Path.cwd() / "backup_failed_upload.json"
     payload = {
         "title": title,
         "parent_id": parent_id,
@@ -153,7 +142,6 @@ def _write_failed_upsert_backup(
         "markdown_content": markdown_content,
         "blocks": blocks,
         "error": repr(error),
-        "created_at": timestamp,
     }
     backup_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return backup_path

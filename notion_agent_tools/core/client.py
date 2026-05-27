@@ -99,11 +99,17 @@ class NotionCoreClient:
             for chunk in _chunks(blocks, MAX_BLOCKS_PER_REQUEST):
                 if not chunk:
                     continue
-                self._call_with_retry(
+                response = self._call_with_retry(
                     self.notion.blocks.children.append,
                     block_id=block_id,
-                    children=chunk,
+                    children=[_block_without_children(block) for block in chunk],
                 )
+                created_blocks = response.get("results", [])
+                for source_block, created_block in zip(chunk, created_blocks, strict=False):
+                    created_block_id = created_block.get("id")
+                    nested_children = _block_children(source_block)
+                    if isinstance(created_block_id, str) and nested_children:
+                        self.append_blocks_chunked(created_block_id, nested_children)
         except APIResponseError as exc:
             raise _wrap_api_error("append blocks", exc) from exc
 
@@ -120,16 +126,16 @@ class NotionCoreClient:
             raise _wrap_api_error("update page title", exc) from exc
 
     def create_child_page(self, parent_page_id: str, title: str, blocks: list[NotionBlock]) -> NotionPage:
-        """Create a child page with up to the first 100 blocks."""
+        """Create a child page and append blocks with API-safe recursive nesting."""
 
-        initial_children = blocks[:MAX_BLOCKS_PER_REQUEST]
         try:
-            return self._call_with_retry(
+            page = self._call_with_retry(
                 self.notion.pages.create,
                 parent={"type": "page_id", "page_id": parent_page_id},
                 properties=_title_properties(title),
-                children=initial_children,
             )
+            self.append_blocks_chunked(str(page["id"]), blocks)
+            return page
         except APIResponseError as exc:
             raise _wrap_api_error("create child page", exc) from exc
 
@@ -172,6 +178,31 @@ class NotionCoreClient:
 def _chunks(items: list[NotionBlock], size: int) -> Iterable[list[NotionBlock]]:
     for index in range(0, len(items), size):
         yield items[index : index + size]
+
+
+def _block_children(block: NotionBlock) -> list[NotionBlock]:
+    block_type = block.get("type")
+    if not isinstance(block_type, str):
+        return []
+    body = block.get(block_type)
+    if not isinstance(body, dict):
+        return []
+    children = body.get("children")
+    return children if isinstance(children, list) else []
+
+
+def _block_without_children(block: NotionBlock) -> NotionBlock:
+    block_type = block.get("type")
+    if not isinstance(block_type, str):
+        return block.copy()
+
+    clean_block = block.copy()
+    body = block.get(block_type)
+    if isinstance(body, dict) and "children" in body:
+        clean_body = body.copy()
+        clean_body.pop("children", None)
+        clean_block[block_type] = clean_body
+    return clean_block
 
 
 def _title_properties(title: str) -> dict[str, Any]:

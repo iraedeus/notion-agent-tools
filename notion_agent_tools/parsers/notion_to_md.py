@@ -244,4 +244,4 @@ def _escape_markdown_text(content: str) -> str:
 
 def _indent_text(text: str, indent: int) -> str:
     spaces = " " * indent
-    return "\n".join(f"{spaces}{line}" if line else "" for line in text.splitlines())
+    return "\n".join(f"{spaces}{line}" if line else "" for line in text.split("\n"))
